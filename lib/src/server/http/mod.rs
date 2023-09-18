@@ -8,7 +8,8 @@ use std::{
     thread,
 };
 
-use actix_web::{actix, fs, http, server, App, HttpRequest, HttpResponse, Responder};
+use actix_files::Files;
+use actix_web::{dev::ServerHandle, get, rt, web, App, HttpResponse, HttpServer, Responder};
 use tokio::time::{interval_at, Duration, Instant};
 
 use crate::sync::*;
@@ -23,9 +24,9 @@ struct HttpState {
     server_metrics: Arc<RwLock<ServerMetrics>>,
 }
 
-fn abort(req: &HttpRequest<HttpState>) -> impl Responder {
+#[get("/server/abort")]
+async fn abort(state: web::Data<HttpState>) -> impl Responder {
     if cfg!(debug_assertions) {
-        let state = req.state();
         // Abort the server from the command
         let mut server_state = state.server_state.write();
         server_state.abort();
@@ -38,10 +39,9 @@ fn abort(req: &HttpRequest<HttpState>) -> impl Responder {
     }
 }
 
-fn metrics(req: &HttpRequest<HttpState>) -> impl Responder {
+#[get("/server/metrics")]
+async fn metrics(state: web::Data<HttpState>) -> impl Responder {
     use std::ops::Deref;
-
-    let state = req.state();
 
     // Send metrics data as json
     let json = {
@@ -78,46 +78,29 @@ pub fn run_http_server(
 ) {
     let address = String::from(address);
     let base_path = PathBuf::from(content_path);
+    let server_state_http = server_state.clone();
 
     let (tx, rx) = mpsc::channel();
 
-    let server_state_http = server_state.clone();
+    let state = HttpState {
+        server_state: server_state_http.clone(),
+        connections: connections.clone(),
+        server_metrics: server_metrics.clone(),
+    };
+
+    // Spawning new server thread
     thread::spawn(move || {
         info!(
             "HTTP server is running on http://{}/ to provide OPC UA server metrics",
             address
         );
-        let sys = actix::System::new("http-server");
-        let addr = server::new(move || {
-            App::with_state(HttpState {
-                server_state: server_state_http.clone(),
-                connections: connections.clone(),
-                server_metrics: server_metrics.clone(),
-            })
-            .resource("/server/metrics", |r| {
-                r.method(http::Method::GET).f(metrics)
-            })
-            .resource("/server/abort", |r| r.method(http::Method::GET).f(abort))
-            .handler(
-                "/",
-                fs::StaticFiles::new(base_path.clone())
-                    .unwrap()
-                    .index_file("index.html"),
-            )
-        })
-        .bind(&address)
-        .unwrap()
-        .start();
 
-        // Give the address info to the quit task
-        let _ = tx.send(addr);
-
-        // Run
-        let _ = sys.run();
+        let server_future = run_server_async(address, base_path, tx, state);
+        rt::System::new().block_on(server_future)
     });
 
-    // Get the address info from the http server thread
-    let addr = rx.recv().unwrap();
+    // Get the handle from the http server thread
+    let server_handle = rx.recv().unwrap();
 
     // Spawn tokio to monitor for quit and to shutdown the http server
     thread::spawn(move || {
@@ -131,8 +114,8 @@ pub fn run_http_server(
                     {
                         let server_state = trace_read_lock!(server_state);
                         if server_state.is_abort() {
-                            let _ = addr.send(server::StopServer { graceful: false });
                             info!("HTTP server will be stopped");
+                            server_handle.stop(false).await;
                             break;
                         }
                     }
@@ -140,4 +123,27 @@ pub fn run_http_server(
                 }
             });
     });
+}
+
+/// Actually creates the [HttpServer] does the address binding and runs it after sending the [ServerHandle].
+async fn run_server_async(
+    address: String,
+    base_path: PathBuf,
+    tx: mpsc::Sender<ServerHandle>,
+    state: HttpState,
+) -> std::io::Result<()> {
+    let server = HttpServer::new(move || {
+        App::new()
+            .app_data(web::Data::new(state.clone()))
+            .service(abort)
+            .service(metrics)
+            .service(Files::new("/", base_path.clone()).index_file("index.html"))
+    })
+    .bind(address)?
+    .run();
+
+    // Give the handle to the quit task
+    let _ = tx.send(server.handle());
+
+    server.await
 }

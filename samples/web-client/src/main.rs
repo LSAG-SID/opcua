@@ -1,5 +1,4 @@
 // OPCUA for Rust
-// OPCUA for Rust
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2017-2022 Adam Lock
 
@@ -12,12 +11,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use actix_web::{
-    actix::{Actor, ActorContext, AsyncContext, Handler, Message, Running, StreamHandler},
-    fs, http,
-    server::HttpServer,
-    ws, App, Error, HttpRequest, HttpResponse,
-};
+use actix::{Actor, ActorContext, AsyncContext, Handler, Message, Running, StreamHandler};
+use actix_files::Files;
+use actix_web::{web, App, Error, HttpRequest, HttpResponse, HttpServer};
+use actix_web_actors::ws;
 
 use opcua::client::prelude::*;
 use opcua::sync::RwLock;
@@ -51,17 +48,25 @@ Usage:
 
 const DEFAULT_HTTP_PORT: u16 = 8686;
 
-fn main() -> Result<(), ()> {
-    let args = Args::parse_args().map_err(|_| Args::usage())?;
-    if args.help {
-        Args::usage();
-    } else {
-        // Optional - enable OPC UA logging
-        opcua::console_logging::init();
-        // Run the http server
-        run_server(format!("127.0.0.1:{}", args.http_port));
+#[actix_web::main]
+async fn main() -> Result<(), ()> {
+    let res = Args::parse_args().map_err(|_| Args::usage());
+    match res {
+        Err(why) => Err(why),
+        Ok(args) => {
+            if args.help {
+                Args::usage();
+            } else {
+                // Optional - enable OPC UA logging
+                opcua::console_logging::init();
+                // Run the http server
+                if let Err(why) = run_server(format!("127.0.0.1:{}", args.http_port)).await {
+                    println!("Error running web server: {}", why);
+                }
+            }
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 #[derive(Serialize)]
@@ -76,6 +81,7 @@ impl Message for DataChangeEvent {
 }
 
 #[derive(Serialize, Message)]
+#[rtype(result = "()")]
 enum Event {
     ConnectionStatusChange(bool),
     DataChange(Vec<DataChangeEvent>),
@@ -98,7 +104,7 @@ struct OPCUASession {
 }
 
 impl Actor for OPCUASession {
-    type Context = ws::WebsocketContext<Self, HttpServerState>;
+    type Context = ws::WebsocketContext<Self>;
 
     /// Method is called on actor start. We start the heartbeat process here.
     fn started(&mut self, ctx: &mut Self::Context) {
@@ -134,38 +140,48 @@ impl Handler<Event> for OPCUASession {
 }
 
 /// Handler for `ws::Message`
-impl StreamHandler<ws::Message, ws::ProtocolError> for OPCUASession {
-    fn handle(&mut self, msg: ws::Message, ctx: &mut Self::Context) {
-        // process websocket messages
-        println!("WS: {:?}", msg);
+impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for OPCUASession {
+    fn handle(&mut self, msg: Result<ws::Message, ws::ProtocolError>, ctx: &mut Self::Context) {
         match msg {
-            ws::Message::Ping(msg) => {
-                self.hb = Instant::now();
-                ctx.pong(&msg);
-            }
-            ws::Message::Pong(_) => {
-                self.hb = Instant::now();
-            }
-            ws::Message::Text(msg) => {
-                let msg = msg.trim();
-                if let Some(msg) = msg.strip_prefix("connect ") {
-                    self.connect(ctx, msg);
-                } else if msg.eq("disconnect") {
-                    self.disconnect(ctx);
-                } else if let Some(msg) = msg.strip_prefix("subscribe ") {
-                    // Node ids are comma separated
-                    let node_ids: Vec<String> = msg.split(',').map(|s| s.to_string()).collect();
-                    self.subscribe(ctx, node_ids);
-                    println!("subscription complete");
-                } else if let Some(msg) = msg.strip_prefix("add_event ") {
-                    let args: Vec<String> = msg.split(',').map(|s| s.to_string()).collect();
-                    self.add_event(ctx, args);
-                    println!("add event complete");
+            Err(why) => println!("WS error: {}", why),
+            Ok(msg) => {
+                // process websocket messages
+                println!("WS: {:?}", msg);
+                match msg {
+                    ws::Message::Ping(msg) => {
+                        self.hb = Instant::now();
+                        ctx.pong(&msg);
+                    }
+                    ws::Message::Pong(_) => {
+                        self.hb = Instant::now();
+                    }
+                    ws::Message::Text(msg) => {
+                        let msg = msg.trim();
+                        if let Some(msg) = msg.strip_prefix("connect ") {
+                            self.connect(ctx, msg);
+                        } else if msg.eq("disconnect") {
+                            self.disconnect(ctx);
+                        } else if let Some(msg) = msg.strip_prefix("subscribe ") {
+                            // Node ids are comma separated
+                            let node_ids: Vec<String> =
+                                msg.split(',').map(|s| s.to_string()).collect();
+                            self.subscribe(ctx, node_ids);
+                            println!("subscription complete");
+                        } else if let Some(msg) = msg.strip_prefix("add_event ") {
+                            let args: Vec<String> = msg.split(',').map(|s| s.to_string()).collect();
+                            self.add_event(ctx, args);
+                            println!("add event complete");
+                        }
+                    }
+                    ws::Message::Binary(bin) => ctx.binary(bin),
+                    ws::Message::Close(_) => {
+                        ctx.stop();
+                    }
+                    ws::Message::Continuation(_) => {
+                        ctx.stop();
+                    }
+                    ws::Message::Nop => (),
                 }
-            }
-            ws::Message::Binary(bin) => ctx.binary(bin),
-            ws::Message::Close(_) => {
-                ctx.stop();
             }
         }
     }
@@ -179,7 +195,7 @@ impl OPCUASession {
                 println!("Context is stopping for client timeout");
                 ctx.stop();
             } else {
-                ctx.ping("");
+                ctx.ping("".as_bytes());
             }
         });
     }
@@ -450,7 +466,7 @@ impl OPCUASession {
 }
 
 /// Handler for creating a new websocket
-fn ws_create_request(r: &HttpRequest<HttpServerState>) -> Result<HttpResponse, Error> {
+async fn ws_create_request(r: HttpRequest, stream: web::Payload) -> Result<HttpResponse, Error> {
     let client = ClientBuilder::new()
         .application_name("WebSocketClient")
         .application_uri("urn:WebSocketClient")
@@ -461,35 +477,28 @@ fn ws_create_request(r: &HttpRequest<HttpServerState>) -> Result<HttpResponse, E
         .unwrap();
 
     ws::start(
-        r,
         OPCUASession {
             hb: Instant::now(),
             client,
             session: None,
             session_tx: None,
         },
+        &r,
+        stream,
     )
 }
 
-#[derive(Clone)]
-struct HttpServerState {}
-
-fn run_server(address: String) {
+async fn run_server(address: String) -> Result<(), std::io::Error> {
     HttpServer::new(move || {
-        let base_path = "./html";
-        let state = HttpServerState {};
-        App::with_state(state)
+        let base_path = "C:\\DEV\\Rust\\opcua\\samples\\web-client\\html"; //"./html";
+        App::new()
             // Websocket
-            .resource("/ws/", |r| r.method(http::Method::GET).f(ws_create_request))
+            .route("/ws/", web::get().to(ws_create_request))
             // Static content
-            .handler(
-                "/",
-                fs::StaticFiles::new(base_path)
-                    .unwrap()
-                    .index_file("index.html"),
-            )
+            .service(Files::new("/", base_path).index_file("index.html"))
     })
     .bind(address)
     .unwrap()
-    .run();
+    .run()
+    .await
 }

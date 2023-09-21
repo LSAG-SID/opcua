@@ -13,7 +13,7 @@ use std::{
 
 use actix::{Actor, ActorContext, AsyncContext, Handler, Message, Running, StreamHandler};
 use actix_files::Files;
-use actix_web::{web, App, Error, HttpRequest, HttpResponse, HttpServer};
+use actix_web::{App, Error, HttpRequest, HttpResponse, HttpServer, web};
 use actix_web_actors::ws;
 
 use opcua::client::prelude::*;
@@ -489,16 +489,18 @@ async fn ws_create_request(r: HttpRequest, stream: web::Payload) -> Result<HttpR
 }
 
 async fn run_server(address: String) -> Result<(), std::io::Error> {
+    println!("\nStarting web server at http://{}/\n", address);
+
     HttpServer::new(move || {
-        let base_path = "C:\\DEV\\Rust\\opcua\\samples\\web-client\\html"; //"./html";
+        let base_path = "./html";
         App::new()
             // Websocket
             .route("/ws/", web::get().to(ws_create_request))
             // Static content
             .service(Files::new("/", base_path).index_file("index.html"))
     })
-    .bind(address)
-    .unwrap()
-    .run()
-    .await
+        .bind(address)
+        .unwrap()
+        .run()
+        .await
 }
